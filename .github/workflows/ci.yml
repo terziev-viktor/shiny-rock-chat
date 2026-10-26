@@ -1,0 +1,194 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  flutter:
+    name: Flutter ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            runner: ubuntu-latest
+          - platform: ios
+            runner: macos-latest
+          - platform: linux
+            runner: ubuntu-latest
+          - platform: macos
+            runner: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare artifact directories
+        run: mkdir -p logs artifacts
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          set -o pipefail
+          sudo apt-get update 2>&1 | tee logs/linux-apt-update.log
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev 2>&1 | tee logs/linux-apt-install.log
+
+      - name: Set up Java
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: matrix.platform == 'android'
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK platform
+        if: matrix.platform == 'android'
+        run: |
+          set -o pipefail
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" 2>&1 | tee logs/android-sdk-install.log
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          cache-path: ${{ runner.tool_cache }}/flutter
+          cache-key: ${{ runner.os }}-flutter-${{ hashFiles('client/pubspec.lock') }}
+
+      - name: Record Flutter version
+        run: flutter --version 2>&1 | tee logs/flutter-version.log
+
+      - name: Get Flutter dependencies
+        working-directory: client
+        run: |
+          set -o pipefail
+          flutter pub get 2>&1 | tee ../logs/flutter-pub-get.log
+
+      - name: Analyze Flutter code
+        working-directory: client
+        run: |
+          set -o pipefail
+          flutter analyze 2>&1 | tee ../logs/flutter-analyze.log
+
+      - name: Run Flutter tests
+        working-directory: client
+        run: |
+          set -o pipefail
+          flutter test --reporter expanded 2>&1 | tee ../logs/flutter-test.log
+
+      - name: Build platform app
+        working-directory: client
+        run: |
+          set -o pipefail
+          case "${{ matrix.platform }}" in
+            android)
+              flutter build apk --debug 2>&1 | tee ../logs/flutter-build.log
+              ;;
+            ios)
+              flutter build ios --debug --no-codesign 2>&1 | tee ../logs/flutter-build.log
+              ;;
+            linux)
+              flutter config --enable-linux-desktop 2>&1 | tee ../logs/flutter-config.log
+              flutter build linux --debug 2>&1 | tee ../logs/flutter-build.log
+              ;;
+            macos)
+              flutter build macos --debug 2>&1 | tee ../logs/flutter-build.log
+              ;;
+          esac
+
+      - name: Package platform build
+        run: |
+          set -euo pipefail
+          case "${{ matrix.platform }}" in
+            android)
+              cp client/build/app/outputs/flutter-apk/app-debug.apk artifacts/app-debug.apk
+              ;;
+            ios)
+              ditto -c -k --sequesterRsrc --keepParent client/build/ios/iphoneos/Runner.app artifacts/ios-app.zip
+              ;;
+            linux)
+              tar -czf artifacts/linux-app.tar.gz -C client/build/linux/x64/debug bundle
+              ;;
+            macos)
+              ditto -c -k --sequesterRsrc --keepParent client/build/macos/Build/Products/Debug artifacts/macos-apps.zip
+              ;;
+          esac
+
+      - name: Upload platform build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.run_id }}-${{ matrix.platform }}-build
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload platform logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.run_id }}-${{ matrix.platform }}-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+  backend:
+    name: Backend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare artifact directories
+        run: mkdir -p logs artifacts
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Record Go version
+        run: go version 2>&1 | tee logs/go-version.log
+
+      - name: Run backend tests
+        working-directory: backend
+        run: |
+          set -o pipefail
+          go test -v ./... 2>&1 | tee ../logs/go-test.log
+
+      - name: Build backend server
+        working-directory: backend
+        run: |
+          set -o pipefail
+          go build -o ../artifacts/shiny-rock-server ./cmd/server 2>&1 | tee ../logs/go-build.log
+
+      - name: Upload backend build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.run_id }}-backend-build
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload backend logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.run_id }}-backend-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 14

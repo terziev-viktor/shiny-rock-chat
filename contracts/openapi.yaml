@@ -1,0 +1,6 @@
+openapi: 3.0.3
+info:
+  title: Shiny Rock Chat API
+  version: 0.1.0
+  description: REST API contract placeholder. Define endpoints before backend implementation.
+paths: {}

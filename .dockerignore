@@ -1,0 +1,7 @@
+.git
+.devcontainer
+client/.dart_tool
+client/build
+client/coverage
+backend/coverage.out
+backend/vendor
