@@ -16,14 +16,14 @@ Do not edit scanner flow, shared chat models, native platform configuration, or 
 
 - Call B1's registration/login API and store the JWT and exact server-issued `qrPayload` in `flutter_secure_storage`.
 - Never generate or modify the QR identity payload locally.
-- Render and share the exact stored payload. Use the existing shared QR core API when present.
+- Render and share the exact stored payload using the `render_qr_matrix` API backed by Rust `shared/qr` (`qrcode` crate); do not generate QR matrices with a separate Flutter dependency.
 - Keep network, secure-storage, and QR rendering dependencies injectable for tests.
-- The scaffold currently has no Rust `shared/qr` crate. Do not invent native bindings or a competing QR implementation. Define or consume the agreed adapter boundary and report any missing core dependency.
+- Consume the agreed Flutter/core API for `shared/qr`; do not invent native bindings or a competing QR implementation. The QR crate and its dependencies must satisfy the plan's FOSS license policy.
 
 ## Dependencies and handoff
 
 - B1 provides registration response and payload format.
-- C3 consumes the shared QR decode boundary if needed.
+- C3 consumes the same shared QR core through `decode_qr_image` and `decode_qr_frame`.
 - C5 owns platform-specific secure storage configuration.
 
 ## Acceptance

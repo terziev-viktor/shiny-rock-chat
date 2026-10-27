@@ -2,7 +2,7 @@
 
 ## Goal
 
-Configure required platform permissions and credentials, document Linux system packages, and add Flutter CI coverage.
+Configure Android and Linux platform requirements, document Linux system packages, and add Flutter CI coverage.
 
 ## Own
 
@@ -14,7 +14,7 @@ Do not edit Flutter feature code, tests, or dependency manifests without coordin
 
 ## Requirements
 
-- Android: camera and internet permissions; minimum SDK 23.
+- Android: camera and internet permissions; minimum SDK 23. Verify live scanning uses the FOSS Flutter `camera` plugin without Google Play Services.
 - Linux: document the `libsecret` build/runtime dependency.
 - Add CI for Android and Linux with `flutter test` and platform smoke builds.
 - Keep workflow secrets out of repository files.
@@ -27,7 +27,7 @@ Do not edit Flutter feature code, tests, or dependency manifests without coordin
 
 ## Acceptance
 
-- Native permissions and entitlements match the plan.
+- Android permissions and Linux configuration match the plan; no Apple platform targets remain.
 - CI runs tests and Android/Linux smoke builds with clear platform-specific results.
 - Linux system dependency is documented.
 
