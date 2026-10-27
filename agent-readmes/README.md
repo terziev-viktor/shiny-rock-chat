@@ -37,7 +37,7 @@ If the `v0-contracts` tag is not present, stop before branching and ask the coor
 - B2 owns the WebSocket hub. B4 requests an offline-delivery hook through an interface; B5 uses the published `SendTo` API. Neither changes B2 files.
 - C2 owns chat message models and the store API. C4 renders that API; C6 adds payments through it without changing C2's implementation.
 - C4 owns `ChatScreen`. C6 supplies a standalone send-payment widget and an integration note; the coordinator wires it into `ChatScreen` after review.
-- C1 owns the shared Flutter QR adapter boundary if one is needed. C3 consumes it and must not create a competing QR bridge. The Rust `shared/qr` core is not present in the current scaffold; report that dependency if it remains unavailable.
+- WP-A9 owns the shared Rust `shared/qr` core for QR generation and decoding. C1 and C3 consume it through the agreed Flutter/core API; neither creates a competing QR implementation. Use the FOSS decoder and generator crates selected by the QR spike, with licenses verified under I14.
 - C5 owns native platform files and CI only. Do not edit Flutter feature code or `pubspec.yaml` unless the coordinator assigns that change.
 
 ## Agent report format

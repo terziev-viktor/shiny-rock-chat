@@ -18,9 +18,9 @@ The `backend/`, `client/`, and `contracts/` directories are intentionally scaffo
 application features have not been implemented.
 
 The Android scaffold targets API 36 and Android 23+. Live camera scanning uses
-`mobile_scanner` on Android, iOS, and macOS. Linux uses image-import scanning;
-QR rendering and image decoding are planned for the Rust `shared/qr` crate,
-exposed through the core API.
+`mobile_scanner` on Android. Linux uses image-import scanning; QR rendering and
+image decoding are planned for the Rust `shared/qr` crate, exposed through the
+core API.
 
 ## Agent work briefs
 
@@ -29,7 +29,7 @@ file ownership, dependencies, and one brief for each implementation agent.
 
 ## CI builds and artifacts
 
-GitHub Actions runs Flutter tests and builds for Android, iOS, Linux, and macOS,
-plus backend tests and a server build. Open the workflow run's **Artifacts**
-section to download each platform build and its logs. Logs upload even when a
-test or build fails; artifacts are retained for 14 days.
+GitHub Actions runs Flutter tests and builds for Android and Linux, plus backend
+tests and a server build. Open the workflow run's **Artifacts** section to
+download each platform build and its logs. Logs upload even when a test or build
+fails; artifacts are retained for 14 days.
