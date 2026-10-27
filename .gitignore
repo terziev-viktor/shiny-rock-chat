@@ -10,9 +10,7 @@
 /client/build/
 /client/coverage/
 /client/android/.gradle/
-/client/ios/Flutter/ephemeral/
 /client/linux/flutter/ephemeral/
-/client/macos/Flutter/ephemeral/
 
 # Editors and operating systems
 .DS_Store

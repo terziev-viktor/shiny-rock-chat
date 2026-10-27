@@ -19,12 +19,8 @@ jobs:
         include:
           - platform: android
             runner: ubuntu-latest
-          - platform: ios
-            runner: macos-latest
           - platform: linux
             runner: ubuntu-latest
-          - platform: macos
-            runner: macos-latest
 
     steps:
       - name: Check out repository
@@ -94,15 +90,9 @@ jobs:
             android)
               flutter build apk --debug 2>&1 | tee ../logs/flutter-build.log
               ;;
-            ios)
-              flutter build ios --debug --no-codesign 2>&1 | tee ../logs/flutter-build.log
-              ;;
             linux)
               flutter config --enable-linux-desktop 2>&1 | tee ../logs/flutter-config.log
               flutter build linux --debug 2>&1 | tee ../logs/flutter-build.log
-              ;;
-            macos)
-              flutter build macos --debug 2>&1 | tee ../logs/flutter-build.log
               ;;
           esac
 
@@ -113,14 +103,8 @@ jobs:
             android)
               cp client/build/app/outputs/flutter-apk/app-debug.apk artifacts/app-debug.apk
               ;;
-            ios)
-              ditto -c -k --sequesterRsrc --keepParent client/build/ios/iphoneos/Runner.app artifacts/ios-app.zip
-              ;;
             linux)
               tar -czf artifacts/linux-app.tar.gz -C client/build/linux/x64/debug bundle
-              ;;
-            macos)
-              ditto -c -k --sequesterRsrc --keepParent client/build/macos/Build/Products/Debug artifacts/macos-apps.zip
               ;;
           esac
 

@@ -1,749 +1,338 @@
-# Shiny Rock Chat — Project README
+# Shiny-Rock Chat — Agent README
 
-A peer‑to‑peer chat application with a supporting backend server. Chats travel peer‑to‑peer over WebRTC whenever possible. The backend provides permanent identity, connection signaling, reliable currency accounting (earn **and** spend), and offline message delivery.
+A peer-to-peer chat with a backend server. Every account owns one permanent QR code. You connect with someone by scanning their QR. Each time your QR is scanned by a **new** person you earn **shiny-rock** (the K-th rewarded scan of your QR is worth **N / K**). Once two users are connected, either can **send shiny-rock to the other inside the chat**.
 
-Supported platforms: **Android, iOS, Linux, macOS**. Windows is not a priority.
+Clients: **Android and Linux**. Apple platforms (iOS, macOS) are **out of scope** because they cannot be served without proprietary dependencies. Windows is not a priority.
+Server: one backend that handles accounts, the authoritative ledger (scan rewards and transfers), peer signaling, offline mailbox and push.
+**Everything we ship and depend on is FOSS. Where no FOSS option exists, we write our own library.**
 
-> **Scope clarifications (v1.3 — mutual scan reward)**
->
-> * **Each first-time scan awards exactly 1 shiny-rock to *both* parties.**
->   When A scans B for the first time: **A gets +1** (the scanner) and **B gets +1** (the scanned). Repeat scans by the same scanner award nothing to either party. Enforced at the DB level with `UNIQUE (scanner_id, scanned_id)`.
-> * **Shiny-rock transfers (transactions)** are in scope. Once two users are connected, either can send shiny-rock to the other **from inside the chat**. Transfers are atomic, idempotent, require an existing connection, and appear as a special message bubble in both peers' chat timelines.
-> * **Global invariant (updated):** `SUM(users.shiny_rock) == 2 × COUNT(scan_events)` at all times, because each scan event mints exactly two shiny-rock.
+This file is the single source of truth for how agents split the work. Read it fully before touching code.
 
 ---
 
-## Table of Contents
+## 1. Invariants (non-negotiable)
 
-1. [Project Summary](#1-project-summary)
-2. [Technology Stack](#2-technology-stack)
-3. [Architecture Overview](#3-architecture-overview)
-4. [Shared Contracts](#4-shared-contracts)
-5. [Repository Scaffolding](#5-repository-scaffolding)
-6. [Backend Agents](#6-backend-agents)
-7. [Client Agents (Flutter)](#7-client-agents-flutter)
-8. [Parallelisation Timeline](#8-parallelisation-timeline)
-9. [Testing & Integration Checklist](#9-testing--integration-checklist)
-10. [Critical Risks & Mitigations](#10-critical-risks--mitigations)
-11. [Definition of Done](#11-definition-of-done)
+| # | Invariant |
+|---|-----------|
+| I1 | Creating an account creates a server-assigned random `account_id` and binds it to the client's Ed25519 public key. The QR encodes `account_id` + key fingerprint. |
+| I2 | The QR never changes. No rotate/re-issue/regenerate endpoint exists. The DB enforces it (immutable columns, UPDATE blocked by trigger). |
+| I3 | Two accounts become contacts only after one scans the other's QR and the scanned side confirms (co-signed handshake recorded by the server). No search/discovery by phone, email or name. |
+| I4 | A rewarded scan of user S's QR credits **S** (the scanned user), not the scanner. |
+| I5 | The K-th rewarded scan of S is worth `N / K` (K starts at 1). `N` is undecided: it lives in exactly one versioned config value, never hardcoded. |
+| I6 | **A scan pair is rewarded once.** For the ordered pair `(scanner → scanned)` only the first confirmed scan is rewarded. If A scans B twice, B is rewarded only for the first scan. Repeats, and self-scans, do not increment K, do not credit anything, and return the original receipt (idempotent). The pair `(B → A)` is a different pair and is rewarded separately. |
+| I7 | Messages are end-to-end encrypted. The server never sees plaintext message content. |
+| I8 | Money is integer fixed-point (µ-rock, 1 shiny-rock = 1,000,000 µ-rock). No floats anywhere in ledger code. |
+| I9 | The ledger is append-only and double-entry. Rows are never updated or deleted. Each row stores its computed amount at write time, so changing `N` later never rewrites history. |
+| I10 | **Transfers**: only between two accounts that are contacts. Sender must be authenticated and a signed `TransferIntent` authorizes it. Amount > 0, sender ≠ recipient, no overdraft: balance can never go below zero. |
+| I11 | A transfer is atomic (debit and credit in one DB transaction), idempotent (same idempotency key returns the same result, never a second transfer) and irreversible (no refund/undo in v1). |
+| I12 | **Conservation**: total supply = sum of all scan rewards ever issued. Transfers only move existing value. Checked by an automated invariant job. |
+| I13 | The server is the only authority for balances and transfer outcomes. A transfer "message" in a chat is only a reference to a server-issued `TransferReceipt`; clients never trust a peer's claim that a transfer happened. |
+| I14 | **FOSS only.** Every library, service, tool and build step in the shipped app and the server must be under an OSI-approved license, with source available. No proprietary SDKs or services (no Firebase/FCM, no Google Play Services, no Play Integrity, no APNs/Apple frameworks, no closed-source blobs). If no FOSS option exists, we implement our own (§8 rule 13). |
 
----
+### Scan reward math (spec for `shared/reward`)
 
-## 1. Project Summary
+- The K-th rewarded scan of account S credits `floor(N / K)` µ-rock. Rounding: floor, remainder discarded (documented, tested).
+- After K rewarded scans S has earned `Σ floor(N / i)` for i = 1..K (about `N · H_K`, the harmonic series).
+- `K` is the per-account counter of rewarded scans, incremented atomically in the same DB transaction that writes the ledger row. Two simultaneous scans must never get the same K. A duplicate pair never reaches the counter (rejected by `UNIQUE(scanner_id, scanned_id)`, then handled as idempotent replay).
+- Golden vectors in `/spec/vectors/reward/`, plus property tests (non-increasing values, determinism, no overflow up to K = 10^9).
 
-| Feature | Behaviour |
-|---|---|
-| **Immutable QR identity** | At sign-up, the backend generates or co-signs an asymmetric key pair. The QR code encodes a server-signed payload containing the user's public key fingerprint and a unique `accountId`. The QR is stored server-side and **cannot be changed** after creation. |
-| **Scan-to-connect** | Scanning another user's QR initiates a connection. The scanner's app sends the scanned payload to the backend, which validates it, credits **both users +1 shiny-rock** (only on the first scan of that pair), and creates a **connection** (edge in `connections`). The backend then signals both peers via WebSocket to establish a WebRTC data channel. |
-| **Shiny-rock currency (earn)** | **Each distinct user who scans you for the first time credits you +1 shiny-rock, and also credits the scanner +1 shiny-rock.** Repeat scans by the same scanner credit nothing to either side. A user's *scan-earned* balance therefore equals `scans_received + scans_made`. |
-| **Shiny-rock currency (spend)** | Once two users are **connected**, either can send shiny-rock to the other from inside the chat. Transfers are atomic, idempotent (client-supplied `transferId`), require an existing connection, and appear as a special message bubble in the chat timeline. |
-| **Offline delivery** | If B is offline, messages from A are stored encrypted on the backend and pushed to B when it reconnects. Transfers are always accepted by the backend (even if the recipient is offline) and reconciled to the chat timeline on next sync. |
+### Transfer rules (spec for `shared/ledger-rules`)
 
----
-
-## 2. Technology Stack
-
-| Layer | Choice | Why |
-|---|---|---|
-| **Client UI** | **Flutter** (Dart) | Single codebase for Android, iOS, Linux, macOS. |
-| **P2P transport** | **`peer_rtc`** (or `flutter_webrtc`) | Cross-platform WebRTC data channels with built-in signaling, auto-reconnect, and mesh support. |
-| **QR generation & image scanning** | **Rust `shared/qr` crate**, exposed through the core API | Generate QR codes and decode QR codes from images across platforms. Evaluate `qrcode` with `rxing` or `rqrr`; check licenses and maintenance in spike S2. |
-| **Live camera scanning** | **`mobile_scanner`** on Android, iOS, and macOS | No Linux support. Linux uses image-import scanning through the Rust core API, without another Flutter scanning plugin. |
-| **Secure key storage** | **`flutter_secure_storage`** | Keychain (iOS/macOS), Keystore (Android), libsecret (Linux). |
-| **Backend language** | **Go** | Native concurrency (goroutines) for signaling and WebSocket fan-out; lower latency than Node.js in WebRTC scenarios. |
-| **Backend framework** | **Fiber v2** or **Chi** | Lightweight HTTP + WebSocket handling. |
-| **Signaling** | **Custom WebSocket hub** (or adapt `flutter-webrtc-server`) | `flutter-webrtc-server` provides a simple Go signaling server with TURN integration. |
-| **Database** | **PostgreSQL** | ACID guarantees for the shiny-rock ledger and transfers. Uses `NUMERIC(20, 8)` for balances so future reward changes and peer transfers don't require a schema migration. |
-| **Decimal handling** | **`shopspring/decimal`** (Go), **`decimal`** package (Dart) | Transfers can include fractions; earns are exact integers. Avoid float drift either way. |
-| **Message queue (optional)** | **NATS** or **Redis Pub/Sub** | Decouple signaling from ledger updates for horizontal scaling. |
-
-> **Note on reward simplicity:** each first-time scan credits exactly `1.00000000` to *each* party, but balances are still stored as `NUMERIC(20, 8)` so peer transfers can use fractional amounts. Should the reward model ever change, the schema will not need to.
+- Valid iff: sender and recipient are contacts, `amount_micro >= MIN_TRANSFER`, `amount_micro <= available balance`, within configured limits (D-8), idempotency key unused, signature valid, nonce fresh.
+- No fees in v1.
+- Validation helpers are shared by server and client so the client can pre-check, but the server's result is final.
 
 ---
 
-## 3. Architecture Overview
+## 2. Open decisions (human owns these). Code against the default, isolate it behind an interface, record an ADR.
+
+| ID | Decision | Default |
+|----|----------|---------|
+| D-1 | Value of `N` | placeholder `REWARD_N = 100_000_000` µ-rock in a versioned config epoch table; changing it creates a new epoch and affects only future scans |
+| D-2 | Spending beyond transfers (shop, conversion to real money) | Out of scope. Shiny-rock is non-convertible in v1. If it ever becomes convertible to money, get legal advice first |
+| D-3 | Account recovery | BIP39-style recovery phrase that re-derives the identity key. Same account, same QR, same balance |
+| D-4 | Anti-farming (no device attestation is possible under I14) | Per-pair single reward (I6), registration **proof-of-work** (own `shared/pow` crate), per-IP/per-device-secret rate limits, new-account cooldown (D-8). Optional later: in-person proximity challenge. Decide before M4 |
+| D-5 | P2P transport | WebRTC data channels with server signaling and a coturn TURN fallback. `flutter_webrtc` is used **directly** (BSD) and plugged into a Rust `Transport` trait (WP-A3, WP-D7). Confirmed or replaced by spike WP-S2 |
+| D-6 | Client stack | Flutter (BSD) UI over a shared Rust core |
+| D-7 | Server stack | Rust (axum) + PostgreSQL + **Valkey** (not Redis), containerized; infra as plain Compose/Kubernetes manifests or **OpenTofu** (not Terraform) |
+| D-8 | Transfer limits | `MIN_TRANSFER` = 1 µ-rock, per-transfer max and daily cap per sender in config, 24 h cooldown before a brand-new account may send. All values are config only |
+| D-9 | Optional memo on a transfer | Allowed, plain text, max 140 chars, E2E-encrypted inside the chat message only |
+| D-10 | QR scanning/rendering | No Google ML Kit. Camera frames come from the Flutter `camera` plugin (Android uses CameraX, Apache-2.0; spike S2 verifies it needs no Google Play Services) and are decoded in the Rust `shared/qr` crate (`rxing` or `rqrr`, license checked). QR drawing also in `shared/qr` (`qrcode` crate) rendered by a Flutter `CustomPainter`. Linux v1 scans by image import/paste only. If the `camera` plugin fails the spike, we write a thin own Android camera plugin (§8 rule 13) |
+| D-11 | Project license | Not chosen yet. Candidates: AGPL-3.0 (strong copyleft, protects the server), MPL-2.0, Apache-2.0. Default for now: **AGPL-3.0-or-later** for everything; the choice constrains which dependency licenses are allowed (WP-F7 allow-list follows this decision) |
+| D-12 | Push notifications (no FCM/APNs) | **UnifiedPush** (FOSS, Web Push standard RFC 8030 with VAPID) via a distributor app such as ntfy. Fallback for users without a distributor: an Android foreground service holding a WebSocket to the server (costs battery) |
+| D-13 | Distribution | F-Droid, a self-hosted F-Droid repository, and direct signed APK downloads. No Google Play. Linux: AppImage/Flatpak/.deb. Goal: reproducible builds |
+| D-14 | Android build toolchain purity | The Android SDK platform/build tools are distributed under Google's SDK license (source is AOSP/Apache-2.0, binaries from Google). Default: use the command-line SDK tools and accept this build-time exception; strict alternative: use distro-built/rebuilt SDK packages (e.g. Debian's, as F-Droid-style builds do). Same question for the Flutter SDK (BSD, but downloads prebuilt engine binaries from Google): default accept, with a documented path to build the engine from source |
+
+---
+
+## 3. Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        CLIENT (Flutter)                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │ Identity/QR │  │ WebRTC Chat │  │ ShinyRock Wallet UI │  │
-│  │             │  │ + Transfers │  │ + Send Shiny-Rock   │  │
-│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘  │
-└─────────┼────────────────┼────────────────────┼─────────────┘
-          │                │                    │
-          ▼                ▼                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     BACKEND (Go)                            │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │ Auth & QR   │  │ Signaling   │  │ ShinyRock Ledger    │  │
-│  │ Service     │  │ Service     │  │ (earn: +1 both)     │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │ Transfers   │  │ Offline     │  │ Scan + Transfer     │  │
-│  │ Service     │  │ Message     │  │ Event Store         │  │
-│  │ (spend)     │  │ Queue       │  │ (PostgreSQL)        │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────── Clients (Android, Linux): Flutter UI over Rust core ────────────┐
+│ onboarding │ my QR │ scan │ chats (+send shiny-rock) │ wallet │ settings    │
+└───────▲──────────────────────────────▲──────────────────────────────────────┘
+        │ WebRTC data channel (P2P)    │ HTTPS + WebSocket (+ UnifiedPush in)
+        │ (TURN relay if NAT blocks)   ▼
+        │                 ┌─────────────────────── Server ───────────────────────┐
+        ▼                 │ api-gateway (auth, rate limit, PoW check)              │
+   other client           │ account-svc  ledger-svc  transfer-svc  signaling-svc   │
+                          │ mailbox-svc  push-gw (Web Push/UnifiedPush) coturn      │
+                          └─ PostgreSQL (accounts, scans, ledger, transfers) + Valkey ┘
 ```
 
-**Key design decisions:**
+Behaviour: when both peers are online they chat directly (WebRTC). Otherwise the sender uploads an **encrypted** blob to the mailbox and the recipient is woken via UnifiedPush (or the WebSocket service). Money never moves peer-to-peer: scan rewards and transfers are always executed by the server ledger, and the chat only carries a reference to the resulting receipt.
 
-1. **The backend never sees plaintext chat messages** when P2P is active. WebRTC data channels are E2E-encrypted by DTLS. Transfer *notifications* flow through the backend, but message content stays P2P.
-2. **The QR payload is server-signed.** Even though the client displays the QR, the payload includes a signature from the backend. This prevents forged QR codes.
-3. **The ledger is append-only on the earn side.** Each row in `scan_events` represents one first-time scanner pair and corresponds to **two** `+1` credits: one to the scanner, one to the scanned user.
-4. **Earn rewards are paid once per `(scanner, scanned)` pair**, enforced by `UNIQUE (scanner_id, scanned_id)`. Each user's `scans_received` = unique scanners who scanned them; `scans_made` = unique users they've scanned. Their total scan-earned balance equals `scans_received + scans_made` (before any transfers).
-5. **Idempotency everywhere:**
-   - Scans: unique constraint on `(scanner_id, scanned_id)`. Repeat scan → no credit to either side, return `rewarded: false`.
-   - Transfers: client-provided UUID `transferId` used as the primary key. Retry with same ID → returns the original transfer, never double-charges.
-6. **Transfers require an existing connection** (a `connections` row between the two users). Prevents spam and matches product intent.
-7. **Money is stored as `NUMERIC(20, 8)`.** Scan rewards are integers but transfers may be fractional. No `double` anywhere.
-8. **Transfers work when the recipient is offline.** The backend accepts and persists the transfer atomically; recipients reconcile via `/v1/payments/history` on next connect.
-
----
-
-## 4. Shared Contracts
-
-> **Freeze these before parallel work begins.** Any change requires a PR to the `contracts` branch and notification to all agents.
-
-### 4.1 REST API (OpenAPI 3.0)
-
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/v1/auth/register` | POST | Create account. Returns `accountId`, `qrPayload` (signed), and a JWT. |
-| `/v1/auth/login` | POST | Authenticate and receive JWT. |
-| `/v1/account/me` | GET | Return current user profile, balance, `scansReceived`, `scansMade`. |
-| `/v1/qr/scan` | POST | Body: `{ "scannedPayload": "..." }`. Validates the scanned QR, **records the scan only if this scanner has never scanned this user before**, credits **+1 shiny-rock to the scanner AND +1 to the scanned user**, and creates a `connections` row. Returns the scan outcome. |
-| `/v1/ledger/balance` | GET | Return current user's shiny-rock balance, `scansReceived`, `scansMade`. |
-| `/v1/payments/send` | POST | Transfer shiny-rock to a connected peer. Body: `{ "transferId": "<client-uuid-v4>", "recipientId": "...", "amount": "10.5", "note": "optional" }`. Returns the completed transfer and the sender's new balance. |
-| `/v1/payments/history` | GET | Query params: `?peerId=<id>&since=<ts>&limit=50`. Returns transfers involving the current user, optionally filtered to a single peer, ordered by `created_at DESC`. |
-| `/v1/messages/offline` | GET | Fetch undelivered messages (when peer was offline). |
-| `/v1/messages/ack` | POST | Acknowledge delivery of offline messages. |
-
-**`POST /v1/qr/scan` — status codes and reward rule:**
-
-| Status | Meaning |
-|---|---|
-| `200 OK` | **First-time scan.** Scan event recorded, **scanner credited +1**, **scanned user credited +1**, `connections` row created. Body: `{ "scanIndex": K, "rewarded": true, "alreadyConnected": false }`. |
-| `200 OK` (repeat) | **Repeat scan by the same user.** No credit to either side, no new scan event. Body: `{ "rewarded": false, "alreadyConnected": true }`. Existing connection is untouched. **Rewards are strictly one-per-pair.** |
-| `400 Bad Request` | Malformed or tampered QR payload. |
-| `403 Forbidden` | Attempted to scan own QR. |
-| `429 Too Many Requests` | Rate limit hit. |
-
-> **`scanIndex` semantics:** when present, it is the **scanned user's** K-th unique scanner count (`scans_received` after this scan). It is *not* the scanner's count. Both parties receive +1 regardless of `scanIndex`.
->
-> **Repeat-scan behaviour:** returns `200 OK` with `rewarded: false` rather than `409` — the user *is* already connected, so they should proceed to the chat; the backend guarantees no second reward.
-
-**`POST /v1/payments/send` — status codes:**
-
-| Status | Meaning |
-|---|---|
-| `200 OK` | Transfer completed. Body: `{ transfer, senderBalance }`. |
-| `400 Bad Request` | Invalid amount (≤ 0, more than 2 decimals), missing fields. |
-| `402 Payment Required` | Insufficient balance. |
-| `403 Forbidden` | No connection between the two users, or self-transfer attempted. |
-| `409 Conflict` | `transferId` already used — returns the **original** transfer for idempotency (do not treat as an error in the client). |
-| `429 Too Many Requests` | Rate limit hit. |
-
-### 4.2 WebSocket Protocol (Signaling, Presence & Transfers)
-
-Connect to `wss://<host>/v1/ws?token=<JWT>`.
-
-**Client → Server messages:**
-
-```json
-{ "type": "join", "peerId": "<accountId>" }
-{ "type": "signal", "to": "<accountId>", "payload": { "sdp": "...", "type": "offer" } }
-{ "type": "signal", "to": "<accountId>", "payload": { "sdp": "...", "type": "answer" } }
-{ "type": "ice", "to": "<accountId>", "candidate": "..." }
-{ "type": "presence", "status": "online" }
-```
-
-> **Note:** Transfers are submitted via REST (`/v1/payments/send`), not via WebSocket. The WS channel is used only to *push* transfer notifications.
-
-**Server → Client messages:**
-
-```json
-{ "type": "peer-online", "peerId": "<accountId>" }
-{ "type": "peer-offline", "peerId": "<accountId>" }
-{ "type": "signal", "from": "<accountId>", "payload": { "sdp": "...", "type": "offer" } }
-{ "type": "ice", "from": "<accountId>", "candidate": "..." }
-{ "type": "offline-message", "message": { "id": "...", "from": "...", "ciphertext": "...", "timestamp": 0 } }
-{ "type": "payment-received", "transfer": { "id": "...", "senderId": "...", "recipientId": "...", "amount": "10.5", "note": "", "createdAt": 0 } }
-{ "type": "payment-sent",     "transfer": { "id": "...", "senderId": "...", "recipientId": "...", "amount": "10.5", "note": "", "createdAt": 0 } }
-```
-
-> **Delivery model:** `payment-received` is pushed to the recipient if online; `payment-sent` is pushed to the sender's other sessions. If a user is offline, no event is queued — the recipient reconciles by calling `GET /v1/payments/history?since=<last-seen-ts>` on WS connect.
->
-> **Scan credits are *not* pushed via WebSocket.** The scanner learns of their own +1 synchronously from the `POST /v1/qr/scan` response (`rewarded: true`). The scanned user learns of their +1 by refreshing `/v1/ledger/balance` — the client is expected to refresh after any chat screen open / app foreground / pull-to-refresh.
-
-### 4.3 Shared Data Models
-
-**Dart (client):**
-
-```dart
-enum MessageKind { text, paymentSent, paymentReceived }
-
-class ChatMessage {
-  final String id;            // for transfers, id == transferId (client-generated UUID)
-  final String peerId;
-  final MessageKind kind;
-  final String? text;         // populated for MessageKind.text
-  final String? amount;       // populated for payment kinds, as decimal string
-  final int timestamp;
-  final bool pending;         // optimistic UI marker
-}
-
-class Account {
-  final String accountId;
-  final String qrPayload;          // signed, immutable
-  final String publicKey;          // base64
-  final String shinyRockBalance;   // decimal string, e.g. "42.00000000"
-  final int scansReceived;         // unique scanners who scanned me
-  final int scansMade;             // unique users I have scanned
-}
-
-class Transfer {
-  final String id;            // transferId (client-generated UUID v4)
-  final String senderId;
-  final String recipientId;
-  final String amount;        // decimal string
-  final String? note;
-  final int createdAt;
-  final String status;        // "completed" | "failed"
-}
-
-class Connection {
-  final String peerId;        // the other side's accountId
-  final int connectedAt;
-}
-
-class ScanResult {
-  final int? scanIndex;       // present only when rewarded == true; == scanned user's scansReceived
-  final bool rewarded;        // true iff BOTH sides were credited +1
-  final bool alreadyConnected;
-}
-```
-
-**Go (backend):**
-
-```go
-type Account struct {
-    ID            string          `json:"accountId"`
-    QRPayload     string          `json:"qrPayload"`
-    PublicKey     []byte          `json:"publicKey"`
-    ShinyRock     decimal.Decimal `json:"shinyRockBalance"`
-    ScansReceived int             `json:"scansReceived"` // unique scanners who scanned me
-    ScansMade     int             `json:"scansMade"`     // unique users I have scanned
-    CreatedAt     time.Time       `json:"createdAt"`
-}
-
-type ScanEvent struct {
-    ScannerID string    `json:"scannerId"`
-    ScannedID string    `json:"scannedId"`
-    ScanIndex int       `json:"scanIndex"` // K for the scanned user
-    Timestamp time.Time `json:"timestamp"`
-    // Reward columns intentionally omitted — each event mints exactly 1 to each side.
-}
-
-type ScanResponse struct {
-    ScanIndex        int  `json:"scanIndex,omitempty"`
-    Rewarded         bool `json:"rewarded"`         // true iff BOTH sides received +1
-    AlreadyConnected bool `json:"alreadyConnected"`
-}
-
-type Transfer struct {
-    ID          string          `json:"id"`
-    SenderID    string          `json:"senderId"`
-    RecipientID string          `json:"recipientId"`
-    Amount      decimal.Decimal `json:"amount"`
-    Note        string          `json:"note,omitempty"`
-    Status      string          `json:"status"`
-    CreatedAt   time.Time       `json:"createdAt"`
-}
-
-type Connection struct {
-    UserA     string    `json:"userA"` // lexicographically smaller
-    UserB     string    `json:"userB"` // lexicographically larger
-    CreatedAt time.Time `json:"createdAt"`
-}
-```
-
----
-
-## 5. Repository Scaffolding
-
-Create a monorepo with two top-level directories:
+### Repository layout (monorepo)
 
 ```
-srock-chat/
-├── backend/          # Go module
-├── client/           # Flutter app
-├── contracts/        # OpenAPI spec, WebSocket schema, shared models
-└── docker-compose.yml
+/spec/             proto schemas, OpenAPI, QR format, protocol docs, test vectors   (Track S)
+/server/           Rust workspace: services below                                   (Track B)
+  crates/api  crates/account  crates/ledger  crates/transfer
+  crates/signaling crates/mailbox  crates/push  crates/common
+/core/             client Rust workspace                                            (Track A)
+  crates/identity crates/storage crates/p2p crates/session crates/handshake
+  crates/wallet crates/sync crates/ffi
+/shared/           used by BOTH server and client: reward, ledger-rules, protocol, qr, pow   (Track S)
+/app/              Flutter app + Android and Linux runners                          (Tracks C, D, E)
+/infra/            compose, manifests/OpenTofu, coturn config, CI                   (Track G)
+/tools/            multi-client simulator, load tests, fixtures, license audit      (Track F)
+/docs/adr/         decision records
 ```
 
-Freeze the contracts in `contracts/` and tag the commit `v0-contracts`. All agents branch from this tag.
+### Server data model (sketch, owned by WP-B1)
 
-**Initial scaffold commands:**
-
-```bash
-mkdir srock-chat && cd srock-chat
-git init
-
-# Backend
-mkdir backend && cd backend
-go mod init github.com/yourorg/srock-chat/backend
-go get github.com/gofiber/fiber/v2
-go get github.com/gofiber/websocket/v2
-go get github.com/jackc/pgx/v5
-go get github.com/golang-jwt/jwt/v5
-go get github.com/shopspring/decimal
-go get github.com/google/uuid
-cd ..
-
-# Client
-flutter create --platforms=android,ios,linux,macos client
-cd client
-flutter pub add peer_rtc mobile_scanner flutter_secure_storage \
-                http web_socket_channel decimal uuid share_plus
-cd ..
-
-# Contracts
-mkdir contracts
-# drop openapi.yaml, ws-protocol.md, models.md here
+```
+accounts(account_id PK, pubkey, key_fp, created_at, qr_payload, pow_proof)   -- immutable columns
+devices(device_id PK, account_id FK, push_endpoint, platform, created_at)
+scans(scan_id PK, scanner_id FK, scanned_id FK, scanner_sig, scanned_sig,
+      created_at, UNIQUE(scanner_id, scanned_id))                            -- I6
+scan_counters(account_id PK, k BIGINT)                                       -- locked per update
+contacts(a_id, b_id, scan_id, created_at)
+transfers(transfer_id PK, from_id FK, to_id FK, amount_micro BIGINT CHECK (>0),
+          idempotency_key, sender_sig, created_at,
+          UNIQUE(from_id, idempotency_key))                                  -- I11
+ledger_entries(seq BIGSERIAL PK, account_id FK,
+               kind ENUM('scan_reward','transfer_out','transfer_in'),
+               amount_micro BIGINT,          -- signed: + credit, - debit
+               scan_id FK NULL, transfer_id FK NULL, k BIGINT NULL,
+               config_epoch INT NULL, created_at)                            -- append-only
+account_balances(account_id PK, balance_micro BIGINT CHECK (>= 0))           -- updated in same tx
+mailbox(msg_id PK, recipient_id, blob BYTEA, created_at, expires_at)
+config_epochs(epoch PK, reward_n BIGINT, active_from)
 ```
 
----
+Invariant job: `SUM(ledger_entries.amount_micro) = SUM(account_balances) = SUM(scan_reward rows)`.
 
-## 6. Backend Agents
+### Scan transaction (WP-B3)
 
-### Agent B1 – Auth & QR Identity Service
+1. Scanner submits `ScanIntent` (signed, idempotency key) to `POST /v1/scans`.
+2. Server validates: signature, scanner ≠ scanned, rate limits. If the pair already exists, return the original receipt and stop (I6).
+3. Server notifies the scanned user; their app returns a signed `ScanAck`.
+4. ONE DB transaction: insert `scans`, `contacts`; lock `scan_counters` row; `k += 1`; `amount = floor(N_active / k)`; insert `ledger_entries(kind=scan_reward)`; update `account_balances`.
+5. Return co-signed `ScanReceipt` to both; the wallet updates via event.
 
-**Goal:** Every account gets a permanent, server-signed QR code that cannot be altered.
+### Transfer transaction (WP-B8)
 
-**Steps:**
+1. In a chat, the sender enters an amount (and optional memo). The client builds `TransferIntent {to, amount_micro, idempotency_key, nonce, timestamp}` and signs it with the identity key.
+2. `POST /v1/transfers`. Server validates signature, nonce freshness, contact relationship, limits (D-8), rate limits.
+3. ONE DB transaction: lock both `account_balances` rows **in ascending `account_id` order** (prevents deadlocks); check `balance >= amount`; insert `transfers`; insert two `ledger_entries`; update both balances.
+4. Server returns a server-signed `TransferReceipt {transfer_id, from, to, amount, seq, timestamp}` and pushes a `TransferReceived` event to the recipient.
+5. The sender's client posts a **`transfer` chat message** (E2E, carrying `transfer_id`, optional memo). Both clients render the bubble by fetching/verifying the `TransferReceipt` from the server (I13), never from the peer's message alone.
+6. Retries with the same idempotency key return the same receipt.
 
-1. Create `POST /v1/auth/register`. On success:
-   - Generate an ECDSA P-256 key pair on the backend (or accept a client-generated public key and co-sign).
-   - Derive `accountId` as `base58(sha256(publicKey))`.
-   - Build the QR payload: `srock://v1/<accountId>?pk=<base64(publicKey)>&sig=<serverSignature>`. The signature covers `accountId + publicKey`.
-   - Store `accountId`, `publicKey`, `qrPayload`, and hashed password in `users` table.
-   - Return a JWT and the `qrPayload`.
-2. Create `POST /v1/auth/login` and `GET /v1/account/me`.
-3. **Critical:** `qrPayload` is **write-once**. Add a database constraint that prevents updates to `qrPayload` after creation. Never expose an endpoint to regenerate it.
-4. **Tests:** Registering twice with the same public key fails; the QR payload signature verifies correctly.
+### Registration and proof-of-work (WP-B2, WP-S4)
 
-**Files:** `backend/internal/auth/`, `backend/internal/qr/`, `backend/migrations/001_users.sql`.
-
----
-
-### Agent B2 – WebSocket Signaling & Presence Service
-
-**Goal:** Connect two peers via WebRTC by relaying SDP offers/answers and ICE candidates; push transfer events.
-
-**Steps:**
-
-1. Implement a WebSocket hub in Go (`/v1/ws`). Authenticate via JWT query parameter.
-2. Maintain an in-memory map of `accountId → *websocket.Conn`. On connect, send `peer-online` to all **connections** of the connecting user (query `connections` table).
-3. Relay `signal` and `ice` messages verbatim between peers. Do not inspect or store SDP payloads.
-4. On disconnect, broadcast `peer-offline`.
-5. **Expose a `SendTo(accountId, payload)` function** on the hub for other services to call. Agent B5 (Transfers) uses this to push `payment-received` / `payment-sent` events.
-6. **Tests:** Two WebSocket clients; a signal sent by one is received by the other. `SendTo` on an offline user is a no-op (no panic).
-
-**Files:** `backend/internal/signaling/hub.go`, `backend/internal/signaling/handler.go`.
+Account creation requires a valid proof-of-work solution (own `shared/pow` crate, memory-hard such as Argon2-based, difficulty set by server config and raised under load) bound to the new public key and a server-issued nonce. This makes mass fake-account creation expensive without any proprietary attestation. It is mitigation, not proof of humanity; see risks.
 
 ---
 
-### Agent B3 – Shiny-Rock Ledger (Earn) + Connections — **+1 to BOTH sides per first-time scan**
+## 4. Contracts (WP-S1 produces these FIRST; everything depends on them)
 
-**Goal:** Correct, idempotent, atomic accounting of shiny-rock scan rewards — **exactly +1 to the scanner and +1 to the scanned user, once per `(scanner, scanned)` pair** — plus the `connections` table that gates transfers.
+1. **QR payload**: `shinyrock://v1/<account_id>.<key_fp>` + checksum, with test vectors.
+2. **Protobuf** (`/spec/proto`): `Account`, `PowChallenge`, `PowSolution`, `ScanIntent`, `ScanAck`, `ScanReceipt`, `TransferIntent`, `TransferReceipt`, `LedgerEntry`, `Envelope` (E2E message kinds `text` and `transfer`), `MailboxItem`, `SignalingMessage`, `Event` (`ScanRewarded`, `TransferReceived`, `BalanceChanged`).
+3. **Server API** (`/spec/server.openapi.yaml` + WebSocket protocol doc): PoW challenge, accounts, scans, transfers (`POST /v1/transfers`, `GET /v1/transfers/{id}`), ledger/transactions query with pagination, balance, mailbox, signaling, push registration (UnifiedPush endpoint + VAPID key), auth (challenge-response signed by the identity key; short-lived tokens).
+4. **Client core API** (`/spec/core-api.md`): `create_account`, `get_qr`, `begin_scan`, `confirm_scan`, `list_contacts`, `send_message`, `send_shiny_rock(contact, amount, memo?)`, `get_balance`, `list_transactions`, `subscribe_events`, `export_recovery`, `restore_account`, `render_qr_matrix(payload)`, `decode_qr_image(bytes)`, `decode_qr_frame(luma_frame)`.
+5. **Reward, ledger-rules and PoW specs + vectors** (§1, §3).
+6. **Chat extension point**: a `MessageRenderer` registry so new message kinds (`transfer`) plug into the chat UI without editing the chat feature's files.
 
-**Steps:**
-
-1. Create `scan_events` and `connections` tables. **No `reward` column** — a scan event *is* two mints:
-
-   ```sql
-   CREATE TABLE scan_events (
-     id BIGSERIAL PRIMARY KEY,
-     scanner_id TEXT NOT NULL,
-     scanned_id TEXT NOT NULL,
-     scan_index INT NOT NULL,
-     created_at TIMESTAMPTZ DEFAULT now(),
-     UNIQUE (scanner_id, scanned_id)   -- ⬅ ONE reward per pair, enforced by DB
-   );
-
-   CREATE TABLE connections (
-     user_a TEXT NOT NULL REFERENCES users(account_id),
-     user_b TEXT NOT NULL REFERENCES users(account_id),
-     created_at TIMESTAMPTZ DEFAULT now(),
-     PRIMARY KEY (user_a, user_b),
-     CHECK (user_a < user_b)           -- canonical order
-   );
-   ```
-
-   Add two integer columns to `users`:
-
-   ```sql
-   ALTER TABLE users ADD COLUMN scans_received INT NOT NULL DEFAULT 0;
-   ALTER TABLE users ADD COLUMN scans_made     INT NOT NULL DEFAULT 0;
-   -- If a legacy total_scans column exists, migrate: scans_received = total_scans, scans_made = 0.
-   ```
-
-2. Implement `POST /v1/qr/scan`:
-   - Validate the scanned `qrPayload` signature. Reject self-scan with `403`.
-   - Begin a transaction.
-   - **First-time-scan guard:**
-     ```sql
-     SELECT EXISTS (
-       SELECT 1 FROM scan_events
-       WHERE scanner_id = $scanner AND scanned_id = $scanned
-     ) AS already_scanned;
-     ```
-     *If `already_scanned == true`:*
-     - Do **not** insert into `scan_events`.
-     - Do **not** credit either side.
-     - Return `200` with `{ rewarded: false, alreadyConnected: true }`.
-   - If this is the first scan by this scanner:
-     - `scanIndex = (SELECT COUNT(*) FROM scan_events WHERE scanned_id = ?) + 1`
-       — the **scanned** user's unique-scanner count after this scan.
-     - `INSERT INTO scan_events (scanner_id, scanned_id, scan_index) VALUES (...)`
-       — if this insert ever hits the unique constraint (concurrent duplicate scan), roll back and return the same `{ rewarded: false, alreadyConnected: true }` response.
-     - **Credit the scanned user:** `UPDATE users SET shiny_rock = shiny_rock + 1, scans_received = scans_received + 1 WHERE account_id = $scanned`.
-     - **Credit the scanner:** `UPDATE users SET shiny_rock = shiny_rock + 1, scans_made = scans_made + 1 WHERE account_id = $scanner`.
-     - `INSERT INTO connections (user_a, user_b) VALUES (LEAST, GREATEST) ON CONFLICT DO NOTHING`.
-     - Return `200` with `{ rewarded: true, scanIndex, alreadyConnected: false }`.
-   - Commit.
-3. Add `GET /v1/ledger/balance` returning `{ shinyRockBalance, scansReceived, scansMade }`.
-4. Expose `ConnectionsExist(a, b) bool` helper (used by B5's transfer handler).
-5. **Tests — must all pass:**
-   - **A scans B once** → A's balance **+1**, B's balance **+1**, `scan_events` has 1 row, `connections` has 1 row.
-   - **A scans B again** → both balances **unchanged**, `scan_events` still 1 row, response says `rewarded: false`.
-   - **A scans B 100 times in parallel** → exactly **+1 to each** total.
-   - **A, C, D each scan B once** → B's balance **+3**, A/C/D each **+1**, `scan_events` has 3 rows.
-   - **B scans A (back) after A scanned B** → new row `(B, A)`; **both +1 again**. This is intentional — each directional first-scan is independent.
-   - **Concurrency across different scanners:** 100 parallel first-time scans to the same user → 100 unique `scan_index` values; the scanned user gains +100; the 100 scanners each gain +1.
-   - **`scan_index` monotonicity** per scanned user: never skips or duplicates.
-   - **Per-user invariant:** for every user, `balance_ignoring_transfers == scans_received + scans_made`.
-   - **Global invariant:** `SELECT SUM(shiny_rock) FROM users == 2 * SELECT COUNT(*) FROM scan_events`.
-
-**Files:** `backend/internal/ledger/service.go`, `backend/internal/ledger/connections.go`, `backend/migrations/002_scan_events.sql`, `backend/migrations/003_connections.sql`, `backend/migrations/003b_user_scan_counters.sql`.
+Rule: **a contract change is a PR to `/spec` only**, reviewed before dependents continue. Everyone regenerates code from `/spec`; never hand-edit generated code.
 
 ---
 
-### Agent B4 – Offline Message Queue
+## 5. Work packages
 
-**Goal:** Deliver messages reliably when one or both peers are offline.
+`deps` must be merged first. Each package lists **owned paths**; do not edit paths you don't own.
 
-**Steps:**
+### Phase 0: Foundation
 
-1. Create `offline_messages` table:
+| ID | Package | Owns | Deps | Done when |
+|----|---------|------|------|-----------|
+| WP-00 | Monorepo scaffold, lint/format, CI skeleton on **FOSS CI** (self-hosted Forgejo/Woodpecker or GitLab CE; decision recorded as ADR). Linux runners only. | `/`, `infra/ci` | none | CI green on empty workspaces; **Android APK build and Linux build of the empty Flutter app run in CI from day 1** |
+| WP-S1 | **Contracts** from §4 with test vectors | `/spec` | none | Tagged `spec-v0.1` |
+| WP-S2 | Spikes → ADRs: (a) `flutter_webrtc` on Android and Linux, NAT/background behavior, TURN; (b) E2E library choice, license check (vodozemac Apache-2.0 / OpenMLS MIT preferred; libsignal is AGPL and only acceptable if D-11 is AGPL-compatible); (c) verify `camera` plugin on Android works **without Google Play Services** (test on a de-Googled image) and that `flutter_webrtc` does too, Android `compileSdk`/AGP/Gradle/Kotlin pinned in the app; (d) key storage: Android Keystore (AOSP) and libsecret on Linux; (e) UnifiedPush end to end with a FOSS distributor and a Web Push/VAPID sender; (f) Rust QR decode quality (`rxing` vs `rqrr`) | `/docs/adr` | none | One ADR each with a recommendation |
+| WP-S3 | `shared/reward` (N/K math, once-per-pair helpers) and `shared/ledger-rules` (transfer validation), fixed-point, vectors, property tests | `shared/reward`, `shared/ledger-rules` | S1 | Used by server and client; all tests pass |
+| WP-S4 | **Own library `shared/pow`**: memory-hard proof-of-work (generate challenge, solve, verify), constant-time verify, tunable difficulty, test vectors, benchmarks on a low-end Android phone | `shared/pow` | S1 | Solve time within target on reference phone; verify under 5 ms on server |
 
-   ```sql
-   CREATE TABLE offline_messages (
-     id UUID PRIMARY KEY,
-     sender_id TEXT NOT NULL,
-     recipient_id TEXT NOT NULL,
-     ciphertext BYTEA NOT NULL,    -- E2E encrypted by client
-     created_at TIMESTAMPTZ DEFAULT now(),
-     delivered_at TIMESTAMPTZ
-   );
-   ```
+### Track B: Server (parallel after `spec-v0.1`)
 
-2. When the signaling service detects that the recipient is offline, the client calls `POST /v1/messages/offline`.
-3. When a user connects via WebSocket, query undelivered messages and push them as `offline-message` events.
-4. Provide `POST /v1/messages/ack`.
-5. **Tests:** Store a message for an offline user, connect that user via WebSocket, assert the message is pushed.
+| ID | Package | Owns | Deps | Acceptance |
+|----|---------|------|------|------------|
+| WP-B1 | Schema + migrations + repositories, immutability and append-only triggers (I2, I9), balance CHECK constraints | `server/crates/common`, `server/migrations` | S1 | UPDATE/DELETE on immutable/append-only tables fails; migrations up/down tested |
+| WP-B2 | **account-svc**: PoW-gated registration (key binding, `account_id` + QR issue), challenge-response auth, tokens, recovery re-bind | `server/crates/account` | B1, S4 | No endpoint can change `qr_payload`; invalid/replayed PoW rejected |
+| WP-B3 | **ledger-svc**: double-entry posting primitives (`post_entries` atomically updating balances, lock ordering), scan transaction (§3), balance/history queries | `server/crates/ledger` | B1, S3 | 1,000 parallel scans of one account get distinct K 1..1000; **A scans B twice → B credited once, second call returns the original receipt**; self-scan rejected; conservation holds |
+| WP-B4 | **signaling-svc**: WebSocket presence + WebRTC offer/answer/ICE relay, contact-gated | `server/crates/signaling` | B1, B2 | Non-contacts refused |
+| WP-B5 | **mailbox-svc**: encrypted blob store-and-forward, TTL, quotas, ack/delete | `server/crates/mailbox` | B1, B2 | Opaque bytes only; expiry and quota tests |
+| WP-B6 | **push-gw**: Web Push (RFC 8030 + VAPID) sender to UnifiedPush endpoints; opaque wake-ups (no content, no amounts, no sender identity); also drives the WebSocket fallback | `server/crates/push` | B1, B2 | Payload audit test; delivers through a FOSS distributor in compose |
+| WP-B7 | **api-gateway**: routing, rate limiting, abuse controls, PoW difficulty control, observability (Prometheus/Grafana/Loki, all FOSS) | `server/crates/api` | B2 | Rate-limit and PoW-difficulty tests |
+| WP-B8 | **transfer-svc**: transfer transaction (§3), idempotency, nonce/replay protection, limits (D-8), `TransferReceipt` signing, events. Develops against the `post_entries` trait from B3 (mock first) | `server/crates/transfer` | B1, B2, S3, B3 trait | 100 parallel transfers from one account with balance B never overdraw; A→B and B→A concurrently do not deadlock; same idempotency key twice = one transfer; non-contact refused; conservation holds |
 
-> **Note:** Transfers do **not** use this queue. The backend persists them in `transfers` atomically; clients reconcile via `/v1/payments/history` on connect.
+### Track A: Client core (parallel with B; develops against mocks generated from OpenAPI)
 
-**Files:** `backend/internal/messages/offline.go`, `backend/migrations/004_offline_messages.sql`.
+| ID | Package | Owns | Deps | Acceptance |
+|----|---------|------|------|------------|
+| WP-A1 | Identity + `KeyStore` trait, recovery-phrase derive/export, QR payload encode/decode, intent signing (`ScanIntent`, `TransferIntent`) | `core/crates/identity` | S1 | Vectors pass; identity immutable |
+| WP-A2 | Encrypted local DB (SQLCipher community edition, BSD-style), migrations | `core/crates/storage` | S1 | Encrypted at rest verified |
+| WP-A3 | P2P layer in Rust: `Transport` trait (open/close peer channel, send/receive framed bytes), signaling client, connection state machine, reconnect/backoff, framing, in-memory loopback transport | `core/crates/p2p` | S1 | Core end-to-end tests pass over loopback; real WebRTC plugged in by WP-D7 |
+| WP-A4 | E2E session + message protocol (ratchet, ordering, receipts, `text` and `transfer` kinds) | `core/crates/session` | S1, S2(b) | Offline/out-of-order and forward-secrecy tests |
+| WP-A5 | Scan handshake client side (`ScanIntent`, `ScanAck`, receipt verification) | `core/crates/handshake` | A1, S1 | Forged/replayed receipts rejected |
+| WP-A6 | Sync + offline queue (mailbox fetch, retries, dedupe) | `core/crates/sync` | A2, A4, B5 mocks | Flaky-network test passes |
+| WP-A7 | Core façade implementing `/spec/core-api.md` | `core/crates/ffi` (Rust side) | A1..A6, A8, A9 (mocks first) | API conformance tests |
+| WP-A8 | **Wallet**: build/sign `TransferIntent`, pre-validation with `shared/ledger-rules`, idempotent retry queue, `TransferReceipt` verification, local balance/transaction cache | `core/crates/wallet` | A1, A2, S3, B8 mocks | Crash mid-send then restart produces exactly one transfer; tampered receipt rejected; peer-claimed transfer without valid receipt flagged |
+| WP-A9 | **QR crate** `shared/qr`: QR matrix generation, decoding from image bytes and from camera luma frames, FFI-friendly API | `shared/qr` | S1, S2(f) | Round-trips spec vectors; decodes rotated, low-contrast, compressed-screenshot QR images and live-frame fixtures |
 
----
+### Track C: Bindings
 
-### Agent B5 – Transfers Service (Spend)
+| ID | Package | Owns | Deps | Acceptance |
+|----|---------|------|------|------------|
+| WP-C1 | FFI bridge (flutter_rust_bridge/UniFFI) + native build scripts: Android ABIs (arm64-v8a, armeabi-v7a, x86_64) and Linux (x86_64, aarch64) | `app/bridge`, `tools/build-native` | S1, A7 skeleton | Hello-world call on Android and Linux in CI |
 
-**Goal:** Allow a connected user to transfer shiny-rock to a peer, atomically, idempotently, and with proper authorization.
+### Track D: Flutter UI (develops against a mock core)
 
-**Steps:**
+| ID | Package | Owns | Deps | Acceptance |
+|----|---------|------|------|------------|
+| WP-D0 | App shell, theme, navigation, mock core (incl. mock wallet), `MessageRenderer` registry | `app/lib/shell`, `app/lib/mock` | S1 | Runs fully on mocks |
+| WP-D1 | Onboarding (incl. PoW progress screen), account creation, "My QR" screen (painter from `render_qr_matrix`, share as image) | `app/lib/features/onboarding` | D0, S4 | QR matches spec vectors |
+| WP-D2 | QR scanner: Android live camera (`camera` plugin frames → `decode_qr_frame`); Linux and fallback everywhere: image import/paste → `decode_qr_image`. Shows "already connected, no new reward" for repeat scans | `app/lib/features/scan` | D0, A9 mock, S2(c) | Scan → handshake progress → success/failure/already-scanned; Linux works with image import |
+| WP-D3 | Chat list + conversation (text, status, timestamps) | `app/lib/features/chat` | D0 | Online/offline states on mock |
+| WP-D4 | Wallet: balance, transaction history (scan rewards with K and amount, sent, received) | `app/lib/features/wallet` | D0, S3 | µ-rock formatted correctly; pagination |
+| WP-D5 | Settings, recovery phrase export/restore with strong warnings (I2), push mode (UnifiedPush / background connection) | `app/lib/features/settings` | D0 | Round-trip on mock |
+| WP-D6 | **Send shiny-rock in chat**: send action, amount entry with balance check, confirmation, in-flight/success/failure states, `transfer` bubble via `MessageRenderer` ("verified" only after receipt check), optional memo | `app/lib/features/chat_transfer` | D0, A8 mocks | Works on mocks incl. insufficient balance, retry after network loss, duplicate-tap safe |
+| WP-D7 | **WebRTC adapter**: implements the core `Transport` trait with `flutter_webrtc` directly (data channels, ICE/TURN config from server, state events, bytes bridged to the core). No wrapper packages | `app/lib/transport_webrtc` | D0, A3 trait, S2(a) | Two app instances exchange framed bytes via server signaling and TURN in compose; reconnects after network switch |
 
-1. Create `transfers` table:
+### Track E: Platform integration (each owns its runner folder)
 
-   ```sql
-   CREATE TABLE transfers (
-     id UUID PRIMARY KEY,              -- client-supplied transferId (idempotency)
-     sender_id TEXT NOT NULL REFERENCES users(account_id),
-     recipient_id TEXT NOT NULL REFERENCES users(account_id),
-     amount NUMERIC(20, 8) NOT NULL CHECK (amount > 0),
-     note TEXT,
-     status TEXT NOT NULL DEFAULT 'completed'
-       CHECK (status IN ('completed', 'failed')),
-     created_at TIMESTAMPTZ DEFAULT now()
-   );
+| ID | Package | Owns | Deps | Acceptance |
+|----|---------|------|------|------------|
+| WP-E1 | **Android**: camera permission, **own thin Kotlin `KeyStore` implementation on the AOSP Android Keystore**, UnifiedPush client integration (FOSS `unifiedpush` library) with foreground-service WebSocket fallback, ABIs, F-Droid-compatible build (no proprietary deps, no anti-features), reproducible APK signing | `app/android` | C1 | Receives a message and a transfer notification while backgrounded on a device **without Google Play Services**; F-Droid metadata builds from source |
+| WP-E2 | **Linux**: libsecret `KeyStore` with encrypted-file fallback, desktop notifications over the live connection, packaging (AppImage, Flatpak, .deb) | `app/linux` | C1 | Runs on Ubuntu LTS + Fedora; no proprietary runtime parts |
 
-   CREATE INDEX idx_transfers_sender    ON transfers(sender_id, created_at DESC);
-   CREATE INDEX idx_transfers_recipient ON transfers(recipient_id, created_at DESC);
-   CREATE INDEX idx_transfers_pair
-     ON transfers(LEAST(sender_id, recipient_id),
-                  GREATEST(sender_id, recipient_id),
-                  created_at DESC);
-   ```
+### Track F: Quality and security (start early, never blocks)
 
-2. Implement `POST /v1/payments/send`:
-   - **Validate body** (`transferId` is valid UUID v4; `recipientId` != `senderId`; `amount > 0`; at most 2 decimal places; fits `NUMERIC(20, 8)`).
-   - **Idempotency check (before transaction):**
-     - `SELECT * FROM transfers WHERE id = transferId`.
-     - If found and `sender_id = current_user`, return `200` with the existing transfer + current balance (retries are safe).
-     - If found and `sender_id != current_user`, return `403`.
-   - **Authorization:** `SELECT EXISTS (... FROM connections WHERE user_a = LEAST(a,b) AND user_b = GREATEST(a,b))`. Not connected → `403`.
-   - **Rate limit:** Per-sender token bucket (30 transfers/min) → `429`.
-   - **Transaction:**
-     ```sql
-     BEGIN;
-     SELECT shiny_rock FROM users WHERE account_id = $sender FOR UPDATE;
-     -- if balance < amount: ROLLBACK; return 402
-     UPDATE users SET shiny_rock = shiny_rock - $amount WHERE account_id = $sender;
-     UPDATE users SET shiny_rock = shiny_rock + $amount WHERE account_id = $recipient;
-     INSERT INTO transfers (id, sender_id, recipient_id, amount, note, status)
-       VALUES (...) ON CONFLICT (id) DO NOTHING;
-     COMMIT;
-     ```
-   - **Post-commit notify:** Use the signaling hub (B2) to push:
-     - `payment-received` → recipient (if online).
-     - `payment-sent` → sender (other sessions).
-   - **Return** `{ transfer, senderBalance }`.
+| ID | Package | Owns | Deps | Acceptance |
+|----|---------|------|------|------------|
+| WP-F1 | Multi-client simulator + fixtures (NAT, latency, loss profiles) | `tools/sim` | A3 draft | Used by A3, A4, A6 tests |
+| WP-F2 | Threat model + review: reward farming without attestation (PoW economics, sybil scans), QR replay, transfer replay/double-spend, forged receipts, laundering across fake accounts, token theft, metadata leakage, malicious server | `docs/security` | S1 | Findings filed as `security` issues |
+| WP-F3 | End-to-end tests: scan → chat → balance → send shiny-rock → both balances correct; Linux↔Linux in CI, Android on real devices or an AOSP-based emulator image (decision recorded in ADR) | `tools/e2e` | D*, E*, G1 | Nightly CI |
+| WP-F4 | Load tests: scan transaction, transfer transaction under contention (hot account), signaling | `tools/load` | B3, B8 | Documented capacity numbers |
+| WP-F5 | Docs and privacy policy draft (server sees: who scanned whom, who paid whom and how much, when, online presence) | `docs` | none | Human review |
+| WP-F6 | **Ledger audit tool**: replays `ledger_entries` from scratch, verifies balances, conservation (I12) and once-per-pair (I6); CI and production cron | `tools/ledger-audit` | B3 | Detects a deliberately corrupted row in a test |
+| WP-F7 | **License and SBOM audit (enforces I14)**: `cargo-deny`, Dart/Flutter and Gradle dependency license scan, REUSE compliance, SBOM generation, allow-list derived from D-11, proprietary-blob scanner for the APK (e.g. flags `com.google.android.gms`, Firebase, ML Kit classes); CI fails on any violation | `tools/license-audit` | WP-00 | A test PR adding a proprietary or incompatible dependency fails CI |
 
-3. Implement `GET /v1/payments/history`:
-   - Params: optional `peerId`, optional `since` (unix ms), optional `limit` (default 50, max 200).
-   - Use the pair index when `peerId` is set.
-   - Order by `created_at DESC`.
+### Track G: Infra
 
-4. **Invariants to enforce / test:**
-   - **Global mint invariant:** `SUM(users.shiny_rock) == 2 × COUNT(scan_events)`. Every scan event mints exactly 2; transfers are zero-sum.
-   - A user can never go negative.
-   - No duplicate `transferId` produces two balance changes.
-
-5. **Tests:**
-   - Happy path (A sends 10 to B), insufficient balance (402), not connected (403), self-transfer (403), duplicate `transferId` (200 with original), concurrent duplicate `transferId` (exactly one debit), rate limit (429).
-
-**Files:** `backend/internal/payments/service.go`, `backend/internal/payments/handler.go`, `backend/migrations/005_transfers.sql`.
+| ID | Package | Owns | Deps | Acceptance |
+|----|---------|------|------|------------|
+| WP-G1 | docker compose (or podman compose) for the whole server stack incl. a UnifiedPush distributor, seed data | `infra/compose` | B1 stubs | One command starts everything locally |
+| WP-G2 | coturn TURN deployment and credential scheme | `infra/turn` | S1 | Relay works across strict NATs |
+| WP-G3 | Production deploy on a Linux VPS, secrets, **PostgreSQL backups with point-in-time recovery (the ledger is money)**, observability, migration pipeline, TLS via a FOSS ACME client | `infra/prod` | B* | Staging live; restore drill documented |
 
 ---
 
-## 7. Client Agents (Flutter)
+## 6. Dependency graph and parallel lanes
 
-### Agent C1 – Identity, Secure Storage & QR Display
+```
+WP-00 ─┐
+WP-S1 ─┼─► [spec-v0.1] ─┬─► S3 ─────────► B3 ─► B8, F6
+WP-S2 ─┘                ├─► S4 ─► B2 (PoW) ; D1
+                        ├─► B1 ─► B2 ─► B4 B5 B6 B7
+                        ├─► A1 ► A5 ┐
+                        ├─► A2 ► A6 ┤
+                        ├─► A3      ├─► A7 ─► C1 ─► E1 E2 ─► F3
+                        ├─► A4      │
+                        ├─► A8 ─────┤   (A8 starts on mocks of B8)
+                        ├─► A9 ─────┘
+                        ├─► D0 ─► D1 D2 D3 D4 D5 D6 D7   (mocks; wire to A7 later)
+                        ├─► G1 G2 ─► G3
+                        └─► F1 F2 F5 F7
+```
 
-**Goal:** Securely store keys and render the immutable QR code.
+Parallelism right after `spec-v0.1`: S3, S4, B1, A1–A4, A8 (mocks), A9, D0, G1, G2, F1, F2, F5, F7 all at once. Then B2 → B4–B7, B3 → B8, D1–D7, A5–A7 fan out.
 
-**Steps:**
-
-1. On first launch, call `POST /v1/auth/register`. Store the JWT and the server-signed `qrPayload` in `flutter_secure_storage`.
-2. Render the QR through the Rust `shared/qr` crate exposed by the core API. The QR content is **exactly** the `qrPayload` returned by the backend — never regenerate locally.
-3. Add a "Share" button (`share_plus`).
-4. **Tests:** The stored `qrPayload` is retrieved unchanged on second launch; the core API renders that exact payload as a QR image.
-
-**Files:** `client/lib/identity/`, `client/lib/ui/qr_display.dart`.
-
----
-
-### Agent C2 – WebRTC Chat & Signaling Client
-
-**Goal:** Establish P2P chat channels using the backend's signaling service; ingest transfer notifications.
-
-**Steps:**
-
-1. Connect to `wss://<host>/v1/ws?token=<JWT>` on app start.
-2. When the user scans a QR (C3), call `POST /v1/qr/scan`, then send a `signal` (offer) to the scanned peer via WebSocket.
-3. Use `peer_rtc` (or `flutter_webrtc`) to create a `Peer` instance. On receiving a `signal`, set the remote description and create an answer.
-4. Once the data channel is open, send messages as JSON `{ "type": "chat", "text": "..." }`.
-5. Listen for `offline-message` WS events and display them in the chat list.
-6. **Listen for transfer events on the WS stream:**
-   - `payment-received` → `chatStore.addPaymentMessage(peerId: transfer.senderId, transfer: ...)`.
-   - `payment-sent` → `chatStore.addPaymentMessage(peerId: transfer.recipientId, transfer: ...)`.
-   These are idempotent upserts by `transferId`, so duplicates from reconnect are harmless.
-7. On WS **connect**, call `GET /v1/payments/history?since=<last_seen_ts>` and store the `last_seen_ts` locally. This reconciles transfers that happened while offline.
-8. **Tests:** Mock WebSocket server emits `payment-received`; assert a payment message is added to the local chat store exactly once (idempotent across reconnects).
-
-**Files:** `client/lib/webrtc/`, `client/lib/chat/chat_service.dart`, `client/lib/chat/payment_sync.dart`.
-
----
-
-### Agent C3 – QR Scanner & Scan Handler
-
-**Goal:** Scan QR codes and trigger the backend scan event and P2P connection. Handle the "first-scan-only reward" contract gracefully — repeat scans still navigate to chat, they just don't reward.
-
-**Steps:**
-
-1. Use `mobile_scanner` for live camera scanning on Android, iOS, and macOS.
-   Linux users import an image; decode its QR through the Rust `shared/qr`
-   crate exposed by the core API.
-2. Decode imported QR images through the Rust `shared/qr` crate exposed by the core API.
-3. On detection, extract the `qrPayload`. Call `POST /v1/qr/scan`.
-4. On `200` (whether `rewarded: true` or `false`):
-   - **Always** initiate the WebRTC connection (C2) and navigate to chat.
-   - **If `rewarded: true`:** the scanner has just earned **+1 shiny-rock** (as has the scanned user). Immediately refresh the local wallet balance so the scanner sees the credit. Optionally show a brief non-intrusive toast like "+1 shiny-rock earned".
-   - **If `rewarded: false`:** no toast — the pair is already connected.
-5. On `400` / `403`, show a user-friendly error.
-6. **Tests:** A mocked camera or imported image emits a known payload; `POST /v1/qr/scan` is called. A second scan for the same payload still navigates to chat but does not trigger a balance refresh or toast.
-
-**Files:** `client/lib/ui/qr_scanner.dart`, `client/lib/scan/scan_handler.dart`.
+Suggested agents (adjust to availability):
+1. Spec agent: S1, reviews contract PRs
+2. Spike agent: S2
+3. Rewards/ledger-rules agent: S3, then B3
+4. Server-data agent: B1, B2
+5. Server-money agent: B8, F6 (works closely with agent 3)
+6. Server-realtime agent: B4, B5, B6
+7. Gateway/abuse agent: B7, F4
+8. Crypto/identity agent: A1, A5, S4
+9. Storage + sync agent: A2, A6
+10. Network agent: A3, F1, G2
+11. Messaging agent: A4
+12. Wallet agent: A8
+13. QR/vision agent: A9
+14. Bindings agent: A7, C1
+15. UI agents (2–3): D0–D7
+16. Platform agents: E1 (Android), E2 (Linux)
+17. Infra agent: G1, G3, WP-00
+18. QA/security/compliance agent: F2, F3, F5, F7
 
 ---
 
-### Agent C4 – Chat UI & Wallet Display
+## 7. Milestones
 
-**Goal:** Display chat history (including transfer bubbles), connection status, and shiny-rock balance.
-
-**Steps:**
-
-1. Build `ChatScreen(peerId)` that listens to a merged message stream from `chatStore` and renders:
-   - `MessageKind.text` → normal bubble.
-   - `MessageKind.paymentSent` / `MessageKind.paymentReceived` → transfer bubble with amount, direction (sent/received), and timestamp. Pending state (`pending: true`) shows a spinner; confirmed shows a checkmark.
-2. Show a "reconnecting" indicator when the WebSocket or WebRTC connection drops.
-3. Build a `WalletScreen` that calls `GET /v1/ledger/balance` and displays shiny-rock with 2 decimal places. Because earns are whole numbers, users will see integers for scan-earned balance and fractions only when a transfer has handed them a fractional amount.
-   - **Wallet refresh triggers:** app foreground, `ChatScreen` first open, pull-to-refresh, after a successful scan (`rewarded: true`), and after a successful transfer. This ensures the scanned user's **+1** (which is not pushed via WebSocket) is visible promptly.
-4. **Tests:** Widget test with a mock message stream containing both text and payment messages; both render correctly and transfer bubbles show the right direction. Widget test that calling `wallet.refresh()` updates the displayed balance.
-
-**Files:** `client/lib/ui/chat/`, `client/lib/ui/chat/payment_bubble.dart`, `client/lib/ui/wallet/`.
+| M | Goal | Includes |
+|---|------|----------|
+| M0 | Contracts frozen, FOSS CI up | 00, S1, S2, F7 |
+| M1 | Server walking skeleton: PoW-gated register, QR, scan with correct N/K and once-per-pair, transfers between contacts, signaling, mailbox, ledger audit passing, in compose, driven by a CLI test client | S3, S4, B1–B5, B8, F6, G1 |
+| M2 | Linux client: account, QR, scan via image import, chat, wallet, send shiny-rock in chat | A1–A9, C1, D0–D4, D6, D7, E2 |
+| M3 | Android client: camera scan, UnifiedPush + fallback, offline delivery, F-Droid build, works without Google Play Services | E1, B6, B7, D5 |
+| M4 | Hardening: anti-farming review, double-spend and replay review, security review, recovery flow, load tests, production deploy with backups | F2, F3, F4, G3 |
+| M5 | Beta | all |
 
 ---
 
-### Agent C5 – Platform Build & CI
+## 8. Rules for agents
 
-**Goal:** One-click builds for Android, iOS, Linux, macOS.
-
-**Steps:**
-
-1. **Android:** `CAMERA`, `INTERNET` permissions. `minSdkVersion 23`.
-2. **iOS:** `NSCameraUsageDescription`. Keychain Sharing capability.
-3. **macOS:** Keychain Sharing and camera entitlements.
-4. **Linux:** Document `libsecret` dependency.
-5. GitHub Actions matrix for `android`, `ios`, `linux`, `macos`.
-6. **Tests:** CI must pass `flutter test` and a smoke build per platform.
-
-**Files:** `.github/workflows/`, `client/android/`, `client/ios/`, `client/macos/`, `client/linux/`.
-
----
-
-### Agent C6 – Transfers UI (Send Shiny-Rock in Chat)
-
-**Goal:** Let a connected user send shiny-rock to their peer from inside the chat, with clear validation, optimistic feedback, and idempotent retries.
-
-**Steps:**
-
-1. **Entry point:** Add a "Send shiny-rock" button in the `ChatScreen` app bar or input bar. Enable only when a connection to this peer exists.
-2. **Dialog:** Modal with:
-   - Amount `TextField` (`numberWithOptions(decimal: true)`).
-   - Optional note `TextField` (max 140 chars).
-   - Live validation: `> 0`, `≤ currentBalance`, at most 2 decimal places.
-   - Confirm button.
-3. **On confirm:**
-   - Generate `transferId = Uuid().v4()` **before** the request.
-   - **Optimistically** append `ChatMessage(kind: paymentSent, id: transferId, pending: true, amount: ...)`.
-   - Call `POST /v1/payments/send`.
-4. **On response:**
-   - `200`: update message `pending: false`; update wallet balance from `senderBalance`; success snackbar.
-   - `402`: remove optimistic message; "Insufficient shiny-rock".
-   - `403`: remove optimistic message; "You can only pay connected users" / "Cannot pay yourself".
-   - `409`: treat as success — the transfer already exists. Update local message to non-pending using the returned `transfer`.
-   - **Network error:** keep the optimistic message `pending: true`; queue a retry (exponential backoff). On retry success, follow the `200` path. **Never** generate a new `transferId` for a retry.
-5. **Store:** `PaymentRepository` with `send(...)` and `history({peerId, since})`. Local `payments` table keyed by `transferId` (upsert).
-6. **Reconciliation on chat open:** Call `GET /v1/payments/history?peerId=<peer>` and merge results via idempotent upsert on `transferId`.
-7. **Tests:**
-   - Valid amount → endpoint called with `transferId` matching the optimistic message; message becomes non-pending.
-   - Insufficient balance → optimistic message removed; error shown.
-   - Retry uses the **same** `transferId` across attempts.
-   - `history(peerId: X)` merges into local store without duplicating existing entries.
-
-**Files:** `client/lib/payments/payment_repository.dart`, `client/lib/payments/send_payment_dialog.dart`, `client/lib/ui/chat/send_payment_button.dart`.
+1. **Stay inside your owned paths.** Cross-boundary needs go through `/spec` or an issue.
+2. **Contracts first.** If one is missing or ambiguous, propose it in `/spec`, then continue behind a feature flag.
+3. **Branches:** `wp/<id>-<short-name>`; small PRs; rebase on `main` before opening.
+4. **Definition of done:** acceptance met, tests, docs, CI green (including the license audit WP-F7), no TODO without an issue number.
+5. **Secrets:** none in the repo. Private identity keys never leave the `KeyStore` implementation. Never log keys, tokens, plaintext, amounts tied to identities, or message metadata outside debug builds.
+6. **Determinism:** reward and ledger code is integer-only and identical across platforms; server and client use the same `shared/*` crates.
+7. **Server authority (I13):** clients may display balances and transfers but only the server decides them. Never trust a client-computed K, amount, balance, or a peer-claimed transfer.
+8. **Money code review:** any change to `server/crates/ledger`, `server/crates/transfer`, `shared/reward` or `shared/ledger-rules` needs a second reviewer and must keep the conservation and concurrency tests green.
+9. **Mocks are first-class:** every module exposes a trait plus an in-memory mock so others can work in parallel.
+10. **Status:** one line per WP in `docs/STATUS.md` (not started / in progress / blocked-on / done).
+11. **Do not decide D-1…D-14 yourself.** Use the default, isolate it, write an ADR.
+12. **FOSS dependency policy (I14).** Every new Flutter, Rust, Kotlin or server dependency needs an ADR line covering: OSI-approved license compatible with D-11, source available, verified maintainers, release age of at least two weeks with real adoption, no proprietary transitive dependencies, and a green build on Android and Linux in CI. Pin exact versions. Use the upstream library directly instead of wrappers or forks that re-wrap something we already use (this is why `flutter_webrtc_zxing` is rejected). Prebuilt binaries are accepted only if their source is FOSS, buildable by us, and the checksum is pinned (for example the libwebrtc build inside `flutter_webrtc`). Platform build settings (`compileSdk`, `minSdk`, AGP, Gradle, Kotlin) are set only in `app/android`. If a dependency breaks a build or violates I14, replace it rather than patching it, unless the fix is trivial.
+13. **Build-our-own rule.** If no FOSS option exists for a need, do not use a proprietary one. Open an ADR "build-own" with: the exact requirement, why existing options fail, the smallest useful scope, an owner WP, a spec in `/spec`, tests/vectors, and the license (D-11). Keep our own libraries small and single-purpose. Current build-own items: `shared/pow` (S4), the Android Keystore bridge in `app/android` (E1), and, only if the spike fails, a thin Android camera plugin (D-10). Candidates to evaluate later: live webcam scanning on Linux.
 
 ---
 
-## 8. Parallelisation Timeline
+## 9. Key risks
 
-| Week | Backend Agents | Client Agents |
-|---|---|---|
-| **1** | B1 (Auth/QR) + B3 (Ledger + Connections, +1 to both) + B4 (Offline Queue) start in parallel. B2 (Signaling) starts after B1 provides JWT shape. | C1 (Identity/QR) + C5 (Build) start. C3 (Scanner) can start with a mock backend. |
-| **2** | B2 finishes WebSocket hub (including `SendTo`). **B5 (Transfers) starts once `connections` schema from B3 is frozen.** | C2 (WebRTC + transfer events) integrates with B2. **C6 (Transfers UI) starts against a mocked `/v1/payments/*` API using the frozen contract.** C4 (UI) builds screens. |
-| **3** | Integration: register → scan → both get +1 → repeat scan (no credit) → send transfer → confirm balance. Load test on `/v1/qr/scan` and `/v1/payments/send` for concurrency. | End-to-end test on Android + iOS: scan QR, both balances +1, connect, send message, **send and receive shiny-rock, verify balance and chat bubble**. |
-
----
-
-## 9. Testing & Integration Checklist
-
-**Earn (scans) — +1 to both sides per first-time scanner:**
-
-- [ ] **QR immutability:** Attempt to update `qrPayload` via any API → must fail.
-- [ ] **First scan credits both:** A scans B for the first time → A's balance **+1** AND B's balance **+1**.
-- [ ] **Repeat scan — no reward:** A scans B a second time → **both** balances unchanged, `scan_events` still has 1 row for `(A, B)`, response has `rewarded: false`.
-- [ ] **Repeat scan — many times:** A scans B 1000 times → both balances after the 1st scan are identical to after the 1000th.
-- [ ] **Concurrent duplicate scan:** 100 parallel scans of B by A → exactly **+1 to each** total.
-- [ ] **Unique scanner count:** A, C, D each scan B once → B's balance **+3**, A/C/D each **+1**, `scan_events` has 3 rows.
-- [ ] **Mutual scan:** A scans B (both +1), then B scans A (both +1 again) → both users end at +2.
-- [ ] **Concurrent unique scans:** 100 parallel first-time scans by 100 distinct scanners to B → 100 unique `scan_index` values; B gains **+100**; each scanner gains **+1**.
-- [ ] **Per-user invariant:** `balance_ignoring_transfers == scans_received + scans_made`.
-- [ ] **Global invariant:** `SUM(users.shiny_rock) == 2 × COUNT(scan_events)`.
-
-**Spend (transfers):**
-
-- [ ] **Happy path:** A → B sends 10; A −10, B +10.
-- [ ] **Idempotency:** Same `transferId` twice → only one debit/credit.
-- [ ] **Concurrent duplicate:** 100 parallel POSTs with the same `transferId` → exactly one debit.
-- [ ] **Insufficient balance:** 402, no balance change.
-- [ ] **Not connected:** 403.
-- [ ] **Self-transfer:** 403.
-- [ ] **Rate limit:** 31 rapid transfers → 429 on the last one.
-- [ ] **Recipient offline:** Transfer accepted, B reconciles via `/v1/payments/history` on reconnect.
-- [ ] **Retry safety:** Network drops mid-request; retry with same `transferId` → one debit only.
-- [ ] **Global mint invariant:** `SUM(users.shiny_rock) == 2 × COUNT(scan_events)`. Transfers are zero-sum.
-
-**Delivery & security:**
-
-- [ ] **Offline message delivery:** A sends a message while B is offline; B receives it on reconnect.
-- [ ] **P2P fallback:** WebRTC failure routes messages through the offline queue.
-- [ ] **Secure storage:** JWT / private key survive restart; not readable in plaintext on disk.
-- [ ] **Cross-platform QR:** QR from Android is scannable by iOS, Linux, macOS.
-- [ ] **Transfer event deduplication:** Receiving the same `payment-received` twice (reconnect) results in one chat bubble (upsert on `transferId`).
-
----
-
-## 10. Critical Risks & Mitigations
-
-| Risk | Mitigation |
-|---|---|
-| **QR code forgery** | Server-signs the payload; client verifies before processing a scan. |
-| **Repeat-scan reward farming** | `UNIQUE (scanner_id, scanned_id)` at the DB level; `POST /v1/qr/scan` short-circuits to `rewarded: false` on repeat scans; concurrency-safe via `INSERT ... ON CONFLICT DO NOTHING` and a rolled-back transaction on conflict. |
-| **Scan race conditions** | PostgreSQL transaction + unique constraint. |
-| **Self-scan farming** | `POST /v1/qr/scan` rejects `scanner_id == scanned_id` with `403`. |
-| **Transfer double-spend** | `SELECT ... FOR UPDATE` on sender row inside transaction. |
-| **Duplicate transfer from retry** | Client-generated `transferId` as PK; second request returns the original transfer. |
-| **Unauthorized transfers** | `connections` table check; no connection → 403. |
-| **Float drift in transfers** | `NUMERIC(20, 8)` in DB; `shopspring/decimal` (Go); `decimal` (Dart). Never use `double`. |
-| **Transfer spam / probing** | Per-sender token bucket (30/min) → 429. |
-| **Transfer delivered while P2P is down** | Transfers are REST operations, not P2P. Chat timeline reconciles via `/v1/payments/history`. |
-| **WebRTC NAT traversal failure** | Bundle TURN server (coturn). |
-| **Client-side key compromise** | `flutter_secure_storage` with biometric protection on Android/iOS. |
-| **Signaling server bottleneck** | Go goroutines; add Redis Pub/Sub for horizontal scale. |
-| **Replay attacks on scan endpoint** | Server-issued nonce in QR payload; reject scans older than a configurable TTL. |
-| **Abuse (fake accounts scanning)** | Rate-limit scans per IP and per account; require email verification before first scan counts. |
-| **Transfer notification lost while offline** | Client fetches `/v1/payments/history?since=<ts>` on every WS connect. |
-| **Scanned user's +1 not pushed via WS** | Client refreshes wallet on app foreground, chat open, pull-to-refresh, and after any successful scan/transfer. Documented as part of C4. |
-
----
-
-## 11. Definition of Done
-
-The project is complete when:
-
-1. Two users on different platforms (e.g. Android + macOS) can register, scan each other's QR codes, and exchange messages over WebRTC.
-2. **A first-time scan credits +1 shiny-rock to the scanner AND +1 to the scanned user**, verified by an integration test.
-3. **Scanning the same user a second time does not credit either party — the reward is strictly one-per-pair — and the client still navigates to the chat.**
-4. A connected user can send shiny-rock to their peer from inside the chat; the sender's balance decreases and the recipient's increases atomically, in exactly one ledger event.
-5. A transfer appears as a distinct message bubble (sent/received direction) in both peers' chat timelines, even if one peer was offline at send time.
-6. Retrying a failed send with the same `transferId` never double-charges.
-7. Unconnected users cannot send shiny-rock to each other.
-8. If a chat message is sent while the recipient is offline, it is delivered on reconnect.
-9. All platform builds (Android, iOS, Linux, macOS) pass CI.
-10. The QR code displayed in the app is byte-identical to the one stored on the backend and cannot be changed.
-11. **Global invariant holds at all times:** `SUM(users.shiny_rock) == 2 × COUNT(scan_events)`.
+- **Reward farming without attestation:** there is no proprietary device attestation, so the defenses are weaker: per-pair single reward (I6), PoW at registration (S4), rate limits, new-account cooldown, optional proximity challenge (D-4). `N/K` makes the first scans most valuable, so test this specifically (F2). Be ready to tune PoW difficulty (B7).
+- **Laundering through transfers:** a farmer can pool rewards from many fake accounts into one. Transfers don't create value (I12), but this matters if shiny-rock ever gains real-world value. Mitigations: cooldown and daily caps (D-8), contact-only transfers, audit tool (F6), review (F2).
+- **Double-spend / race conditions:** only the single DB transaction with ordered row locks plus CHECK constraints protects us; keep it simple and heavily tested (B8, F4).
+- **Irreversible transfers:** a mistaken amount cannot be undone in v1. UX must show a clear confirmation (D6).
+- **Lost key = lost identity and balance**, because the QR is permanent. Recovery phrase UX (D5) is critical.
+- **Push on Android without Google:** UnifiedPush needs the user to install a distributor; the foreground-service fallback costs battery. Reliability must be measured on real devices (E1, F3).
+- **Android is not fully FOSS at the platform level:** most phones ship Google's proprietary firmware and services, and the SDK has license caveats (D-14). We only control our own app and build: it must run correctly without any proprietary Google component.
+- **Smaller audience:** no iOS or macOS, no Google Play. Distribution is F-Droid, own repo or APK (D-13).
+- **Linux has no live camera scanning in v1:** image import only (D-10).
+- **Metadata honesty:** the server necessarily sees who scanned whom and who paid whom and how much. Say so in privacy docs (F5).
+- **Legal:** while shiny-rock is non-convertible and non-purchasable (D-2) this stays simple. Any path to real money changes that.
+- **Changing N later** must create a new config epoch and never alter existing ledger rows (I9).
+- **License drift:** transitive dependencies can bring in non-FOSS code. WP-F7 must run on every PR.

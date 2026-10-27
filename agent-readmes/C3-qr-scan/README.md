@@ -14,7 +14,7 @@ Do not edit identity display, WebRTC implementation, chat-store internals, walle
 
 ## Requirements
 
-- Use `mobile_scanner` for live camera scan on Android, iOS, and macOS.
+- Use `mobile_scanner` for live camera scan on Android.
 - Support Linux image import through the shared QR decode adapter.
 - Call `POST /v1/qr/scan` with the decoded payload.
 - On either successful result (`rewarded: true` or `false`), open/connect to the peer and navigate to chat.
